@@ -1,0 +1,1067 @@
+---
+title: "House_Price_Project"
+format:
+  html:
+    toc: true
+execute:
+  echo: true
+---
+
+# Libraries
+
+```{r}
+#Data Manipulation & Visualization
+library(tidyverse)
+library(dplyr)
+library(ggplot2)
+
+#Data Cleaning & Reshaping
+library(reshape2) # data reshaping (melt)
+library(janitor) # clean column names, remove empty rows/cols
+
+#Statistical Analysis & Modeling
+library(psych) # descriptive statistics
+library(broom) # tidy model outputs
+library(ranger) # random forest models
+
+#Shiny App & Dashboard
+library(shiny) # Shiny framework
+library(shinydashboard) # dashboard layout
+library(DT) # interactive tables
+```
+
+```{r}
+conflicted::conflicts_prefer(dplyr::filter)
+```
+
+Load House Pricing Data set
+
+```{r}
+df <- read.csv("D:/Business Technology/Level 3/Semester 1/Statistical Computing/Project/Raw Data/house_prices/house_prices.csv",stringsAsFactors = FALSE)
+```
+
+Display the structure of the data frame:\
+column names, data types, and number of observations
+
+```{r}
+str(df)
+```
+
+Count the number of missing values (NA) in each column.
+
+```{r}
+colSums(is.na(df))
+```
+
+Function cleans the data set by converting common text representations of missing values into NA values and applies this cleaning step to all columns in the data frame.
+
+```{r}
+replace_nonstd_na <- function(x) {
+  if (is.factor(x)) x <- as.character(x)
+  if (!is.character(x)) return(x)
+  vals <- str_trim(tolower(x))
+  to_na <- c("", "na", "n/a", "null", "none", "nil", "-", "?")
+  x[vals %in% to_na] <- NA
+  return(x)
+}
+
+clean_df <- df %>%
+  mutate(across(everything(), replace_nonstd_na))
+```
+
+Remove duplicate rows from data set
+
+```{r}
+clean_df <- clean_df %>%
+  distinct()
+```
+
+Count missing values in each column and identify columns that still contain NA values.
+
+```{r}
+colSums(is.na(clean_df))
+
+names(clean_df)[colSums(is.na(clean_df)) > 0]
+```
+
+Calculate and display the percentage of missing values in each column
+
+```{r}
+print(data.frame(colSums(is.na(clean_df)) / nrow(clean_df) * 100))
+```
+
+# Data Cleaning
+
+### Drop Columns
+
+Remove selected columns that had 30% or more Missing
+
+```{r}
+clean_df <- clean_df %>% select(-Plot.Area, -Dimensions, -Super.Area, -Ownership, -Car.Parking, -Society, -overlooking, -facing, -Carpet.Area, -Description)
+```
+
+Standardize column names to a clean, consistent format lowercase
+
+```{r}
+clean_df <- clean_df %>% clean_names()
+```
+
+Show first 6 rows of Data set
+
+```{r}
+head(clean_df)
+```
+
+Generate descriptive statistics for all variables in the dataset
+
+```{r}
+describe(clean_df)
+```
+
+### title Splitting
+
+Extract the number of bedrooms from the title text (e.g., "2 BHK" or "studio") and store it as a numeric variable called Bedrooms
+
+```{r}
+clean_df <- clean_df %>%
+  mutate(
+    Bedrooms = case_when(
+      str_detect(tolower(title), "\\d+\\s*bhk") ~
+        as.numeric(str_extract(tolower(title), "\\d+(?=\\s*bhk)")),
+      str_detect(tolower(title), "studio") ~ 1,
+      TRUE ~ NA_real_
+    )
+  )
+```
+
+### Price Cleaning
+
+Rename the price_in_rupees column to price for simplicity
+
+```{r}
+clean_df <- clean_df %>%
+  rename(price = price_in_rupees)
+```
+
+Count the number of missing values in the price column
+
+```{r}
+sum(is.na(clean_df$price))
+```
+
+Impute missing price values using the median, and create a log-transformed price variable and summarize both two new columns
+
+```{r}
+median_price <- median(clean_df$price, na.rm = TRUE)
+
+clean_df <- clean_df %>%
+  mutate(price_imp = if_else(is.na(price), median_price, price)) %>%
+  mutate(log_price = log1p(price_imp))
+
+summary(clean_df$price_imp)
+summary(clean_df$log_price)
+```
+
+Calculate the interquartile range (IQR) and define lower and upper bounds to identify price outliers
+
+```{r}
+Q1 <- quantile(clean_df$price_imp, 0.25, na.rm = TRUE)
+Q3 <- quantile(clean_df$price_imp, 0.75, na.rm = TRUE)
+
+IQR_price <- Q3 - Q1
+
+lower_bound <- Q1 - 1.5 * IQR_price
+upper_bound <- Q3 + 1.5 * IQR_price
+```
+
+Count the number of observations with price values identified as outliers
+
+```{r}
+clean_df %>%
+  filter(price_imp < lower_bound | price_imp > upper_bound) %>%
+  nrow()
+```
+
+Calculate the percentage of observations with price values identified as outliers
+
+```{r}
+clean_df %>%
+  filter(price_imp < lower_bound | price_imp > upper_bound) %>%
+  nrow() / nrow(clean_df) * 100
+
+```
+
+Remove price outliers by keeping only observations within the IQR-based bounds
+
+```{r}
+clean_df <- clean_df %>%
+  filter(price_imp >= lower_bound & price_imp <= upper_bound)
+```
+
+```{r}
+clean_df <- clean_df %>%
+  filter(price_imp > 0)
+```
+
+### Floor Splitting
+
+Split the floor information into current and total floors, clean and convert them to numeric values, handle special cases (basement/ground), impute missing values using the mode, and preview the cleaned data.
+
+```{r}
+clean_df <- clean_df %>%
+  separate(
+    col = floor, 
+    into = c("Current_Floor", "Total_Floors"), 
+    sep = " out of ",
+    remove = FALSE,
+    fill = "left"
+  ) %>%
+mutate(
+   Current_Floor = ifelse(
+      grepl("basement", tolower(Current_Floor)), 
+      "-1",
+      ifelse(
+        grepl("ground", tolower(Current_Floor)),
+        "0",
+        Current_Floor
+      )
+    ),
+   # gsub remove any thing not in list
+    Current_Floor = as.numeric(gsub("[^0-9.-]", "", Current_Floor)),
+    Total_Floors = as.numeric(gsub("[^0-9.]", "", Total_Floors))
+  )
+v_current <- clean_df$Current_Floor
+v_current <- v_current[!is.na(v_current)] 
+uniqv_current <- unique(v_current)
+mode_current_floor <- uniqv_current[which.max(tabulate(match(v_current, uniqv_current)))]
+
+v_total <- clean_df$Total_Floors
+v_total <- v_total[!is.na(v_total)] 
+uniqv_total <- unique(v_total)
+mode_total_floors <- uniqv_total[which.max(tabulate(match(v_total, uniqv_total)))]
+
+clean_df <- clean_df %>%
+  mutate(
+    Current_Floor = tidyr::replace_na(Current_Floor, mode_current_floor),
+    Total_Floors = tidyr::replace_na(Total_Floors, mode_total_floors)
+  )
+
+head(clean_df)
+```
+
+### Other Columns Cleaning
+
+Remove unnecessary or redundant columns after feature engineering and cleaning
+
+```{r}
+clean_df <- clean_df %>% select(-floor, -status, -price, -amount_in_rupees)
+```
+
+Convert the balcony and bathroom columns to numeric type
+
+```{r}
+clean_df$balcony <- as.numeric(clean_df$balcony)
+clean_df$bathroom <- as.numeric(clean_df$bathroom)
+```
+
+Impute missing values in the balcony column using the median
+
+```{r}
+clean_df <- clean_df %>%
+  mutate(
+    balcony = ifelse(
+      is.na(balcony),
+      median(balcony, na.rm = TRUE),
+      balcony
+    )
+  )
+```
+
+Impute missing values in the bathroom and Bedrooms columns using their median values
+
+```{r}
+bath_median <- median(clean_df$bathroom, na.rm = TRUE)
+bed_median  <- median(clean_df$Bedrooms, na.rm = TRUE)
+
+clean_df <- clean_df %>%
+  mutate(
+    bathroom = ifelse(is.na(bathroom), bath_median, bathroom),
+    Bedrooms = ifelse(is.na(Bedrooms), bed_median, Bedrooms)
+  )
+```
+
+Keep only observations with valid furnishing categories
+
+```{r}
+clean_df <- clean_df %>%
+  filter(furnishing %in% c("Furnished", "Semi-Furnished", "Unfurnished"))
+```
+
+Impute missing furnishing values using the most frequent category
+
+```{r}
+clean_df <- clean_df %>%
+  mutate(
+    furnishing = ifelse(
+      is.na(furnishing),
+      mode(furnishing),
+      furnishing
+    )
+  )
+```
+
+Impute missing values in the transaction column using the most frequent category
+
+```{r}
+clean_df <- clean_df %>%
+  mutate(
+    transaction = ifelse(
+      is.na(transaction),
+      mode(transaction),
+      transaction
+    )
+  )
+```
+
+Display the percentage of missing values in each column after all cleaning steps
+
+```{r}
+print(data.frame(colSums(is.na(clean_df)) / nrow(clean_df) * 100))
+```
+
+# EDA
+
+plots a histogram to visualize the distribution of property prices before applying any transformation
+
+```{r}
+ggplot(clean_df, aes(x = price_imp)) +
+  geom_histogram(fill = "skyblue",
+    color = "black",
+    na.rm = TRUE
+  ) +
+  labs(
+    title = "Histogram of Price (Before Transformation)",
+    x = "Price",
+    y = "Frequency"
+  ) +
+  theme_minimal()
+```
+
+plots a histogram of the log-transformed price variable to examine the distribution and impact of extreme values.
+
+```{r}
+ggplot(clean_df, aes(x = log_price)) +
+  geom_histogram(
+    fill = "skyblue",
+    color = "black",
+    na.rm = TRUE
+  ) +
+  labs(
+    title = "Histogram of Price (After Log Transformation)",
+    x = "Log(Price)",
+    y = "Frequency"
+  ) +
+  theme_minimal()
+```
+
+The boxplot indicates a right-skewed price distribution with several high-price outliers.
+
+```{r}
+ggplot(clean_df, aes(x = "", y = price_imp)) +
+  geom_boxplot(fill = "green") +
+  labs(title = "Rupees Plot", y = "Prices")
+```
+
+The distribution of log_price shows **negative (left) skewness**, as indicated by the longer lower tail and the presence of many low-value outliers.
+
+```{r}
+boxplot(clean_df$log_price,
+        main = "Boxplot of log Price",
+        ylab = "Price",
+        col = "lightblue")
+```
+
+The balcony variable is right-skewed, with most observations between 1 and 3 balconies.
+
+```{r}
+clean_df %>%
+  ggplot(aes(x = balcony)) +
+  geom_histogram(binwidth = 1, fill = "skyblue", color = "black") +
+  labs(
+    title = "Histogram of Balcony Variable",
+    x = "Balcony (Count)",
+    y = "Frequency"
+  ) +
+  theme_minimal()
+```
+
+The Histogram chart shows that most properties have 2 or 3 bathrooms, which are the most common values in the dataset. The distribution is right-skewed, as the frequency decreases for properties with a higher number of bathrooms.
+
+```{r}
+ggplot(clean_df, aes(x = bathroom)) +
+  geom_histogram(fill = "blue", color = "black") +
+  labs(
+    title = "Distribution of Number of Bathrooms",
+    x = "Number of Bathrooms",
+    y = "Count"
+  ) +
+  theme_minimal()
+
+```
+
+The dataset contains 174267 observations and 12 variables
+
+```{r}
+dim(clean_df)
+```
+
+The data types of all variables were checked using `sapply()` to ensure correctness before analysis.
+
+```{r}
+sapply(clean_df, class)
+```
+
+Relationship: price vs bathrooms
+
+The relationship is positive but weak because prices vary widely for the same number of bathrooms, and many other factors influence price more than bathrooms alone.
+
+```{r}
+ggplot(clean_df, aes(x = bathroom, y = price_imp)) +
+  geom_jitter(alpha = 0.3) +
+  geom_smooth(method = "lm") +
+  labs(
+    title = "Relationship between price and number of bathrooms",
+    x = "Number of bathrooms",
+    y = "Log price"
+  ) +
+  theme_minimal()
+```
+
+This boxplot shows the distribution of property prices across the top 10 most frequent locations. The plot allows comparison of price levels and variability between locations.
+
+```{r}
+top_loc <- clean_df %>% count(location, sort=TRUE) %>% slice_head(n=10) %>% pull(location)
+
+ggplot(clean_df %>% filter(location %in% top_loc),
+       aes(x = fct_reorder(location, price_imp, median), y = price_imp)) +
+  geom_boxplot() +
+  coord_flip() +
+  labs(
+    title = "Price distribution across top 10 locations",
+    x = "Location",
+    y = "Price"
+  ) +
+  theme_minimal()
+```
+
+The price distribution is nearly identical across all furnishing types. Most homes cluster in the same price range, with a few high-price outliers in every category.
+
+```{r}
+ggplot(clean_df, aes(x = furnishing, y = price_imp)) +
+  geom_violin() +
+  labs(
+    title = "Effect of furnishing on price",
+    x = "Furnishing status",
+    y = "price"
+  ) +
+  theme_minimal()
+```
+
+This heatmap shows strong connections between bedrooms and bathrooms (0.80) and between current and total floors (0.71). while, individual features like rooms and floors show a positive but moderate (0.17-0.26) link to the house price.
+
+```{r}
+numeric_df <- clean_df %>%
+  select(where(is.numeric))
+numeric_df <- numeric_df %>% select(-index)
+
+correlation_matrix <- cor(numeric_df, use = "pairwise.complete.obs")
+
+# long format (convert form correlation matrix to columns)
+melted_cor <- melt(correlation_matrix)
+
+ggplot(melted_cor, aes(x = Var1, y = Var2, fill = value)) +
+  geom_tile() +
+  geom_text(aes(label = round(value, 2)), color = "black", size = 3) +
+  scale_fill_gradient2(
+    low = "firebrick", 
+    mid = "white",
+    high = "steelblue", 
+    midpoint = 0,
+    limit = c(-1, 1),
+    name = "Correlation"
+  ) +
+  labs(
+    title = "Correlation Heatmap of Available Numeric Variables"
+  )+
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+```
+
+# Data manipulation
+
+Descriptive Questions
+
+1.  The effect of the number of bathrooms & Bedrooms on price.
+
+```{r}
+avg_price_per_room_types <-
+clean_df %>%
+  group_by(Bedrooms, bathroom) %>%
+  summarise(
+    median_price = median(price_imp, na.rm = TRUE),
+    count = n()
+  ) %>%
+  filter(count >= 10) %>%
+  arrange(Bedrooms, bathroom) %>%
+  arrange(desc(median_price)) %>%
+  head()
+
+avg_price_per_room_types
+```
+
+2.  counting transactions and arranging them in asc order
+
+```{r}
+Transaction_Count <-
+clean_df %>%
+  count(transaction) %>% 
+  arrange(n)
+
+Transaction_Count
+```
+
+3.  show the prices in different locations with different types of transactions
+
+```{r}
+price_in_location_and_Transactions <- 
+  clean_df%>%
+  group_by(location,transaction)%>%
+  distinct()%>%
+  summarize(price_median = median(price_imp),
+            count = n()) %>%
+  arrange(location, transaction) %>%
+  head(20)
+price_in_location_and_Transactions
+```
+
+4.  Calculate the median house price for each category of bedrooms in the dataset. Then, sort the results in descending order based on the median price, from the highest to the lowest.
+
+```{r}
+median_price_by_bedrooms <- 
+  clean_df %>%
+  group_by(Bedrooms) %>%
+  summarise(median_price = median(price_imp, na.rm = TRUE)) %>%
+  arrange(desc(median_price))
+
+median_price_by_bedrooms
+```
+
+5.  Does increasing balcony? Does it affect price?
+
+```{r}
+price_per_balcony <-
+clean_df %>%
+  group_by(balcony) %>% 
+  summarise(
+    mean_price=mean(price_imp, na.rm = TRUE), 
+    median_price=median(price_imp, na.rm = TRUE)
+  ) %>%
+  arrange(balcony) %>%
+  head(10)
+
+price_per_balcony
+```
+
+6.  What is the distribution of house prices across different furnishing types?
+
+```{r}
+clean_df %>%
+  mutate(furnishing = as.factor(furnishing)) %>%
+  group_by(furnishing) %>%
+  summarise(
+    mean_price   = mean(price_imp, na.rm = TRUE),
+    median_price = median(price_imp, na.rm = TRUE),
+    sd_price     = sd(price_imp, na.rm = TRUE),
+    n_houses     = n()
+  ) %>%
+  arrange(desc(median_price))
+```
+
+7.  What is the typical price range for houses at different floor levels?
+
+```{r}
+clean_df %>%
+  group_by(Current_Floor) %>%
+  summarize(
+    min_price = min(price_imp, na.rm = TRUE),
+    max_price = max(price_imp, na.rm = TRUE)
+  )
+```
+
+8.  What are the most expensive locations based on median house prices?
+
+```{r}
+clean_df%>%
+  group_by(location)%>%
+  summarize(price_median = median(price_imp , na.rm = TRUE)) %>%
+  arrange(desc(price_median))
+```
+
+# Statistical inference
+
+This t-test proves that "not top floor" units cost significantly more (avg \$6,565) than "top floor" units (avg \$5,999)
+
+```{r}
+clean_df <- clean_df %>%
+  mutate(
+    floor_type = if_else(
+      Current_Floor == Total_Floors,
+      "top floor",
+      "not top floor"
+    )
+  )
+
+ttestresult<-t.test(price_imp ~ floor_type, clean_df)
+
+ttestresult
+```
+
+confirms that location has a statistically significant impact on house prices. With an F-value of 1,026.8 and a near-zero p-value
+
+```{r}
+clean_df_model<- lm(price_imp ~ location, data = clean_df )
+anova(clean_df_model)
+```
+
+shows that both location and furnishing have a statistically significant impact on house prices While location is the biggest factor, furnishing also has an impact on it.
+
+```{r}
+clean_df_model2<- lm(price_imp ~ location + furnishing, data = clean_df )
+anova(clean_df_model2)
+```
+
+# linear regression model
+
+1.  Multiple Linear Regression using (bathroom, balcony, Bedrooms) Columns
+
+    performs an 80/20 data split
+
+```{r}
+set.seed(123)
+n <- nrow(clean_df)
+train_idx <- sample(seq_len(n), size = floor(0.8 * n))
+
+train <- clean_df[train_idx, , drop = FALSE]
+test  <- clean_df[-train_idx, , drop = FALSE]
+```
+
+builds a prediction model to see how much bathrooms, balconies, and bedrooms affect house prices and summarizes the results into a simple table.
+
+```{r}
+model <- lm(price_imp ~ bathroom + balcony + Bedrooms, data = train)
+tidy(model)
+```
+
+Each additional balcony adds \$605, each bathroom adds \$498, and each bedroom adds \$263 to a base price of \$3,442. All features are statistically significant, but they only explain 9.8% of the total price variation.
+
+```{r}
+summary(model)
+```
+
+2.  Random Forest Non_Linear Regression
+
+performs an 80/20 data split
+
+```{r}
+set.seed(123)
+train_idx <- sample(seq_len(nrow(clean_df)), size = 0.8 * nrow(clean_df))
+train <- clean_df[train_idx, ]
+test  <- clean_df[-train_idx, ]
+```
+
+trains a **Random Forest** model using 100 decision trees to predict prices,uses "permutation" to rank features
+
+```{r}
+rf <- ranger(
+  price_imp ~ Bedrooms + bathroom + balcony +
+    Current_Floor + Total_Floors,
+  data = train,
+  num.trees = 100,
+  importance = "permutation"
+)
+```
+
+This Random Forest model explains 60.3% of the price variation on new data, a massive improvement over the 9.8% achieved by the simple linear regression.
+
+```{r}
+pred_rf_log <- predict(rf, data = test)$predictions
+
+ss_res_rf <- sum((test$price_imp - pred_rf_log)^2, na.rm = TRUE)
+ss_tot_rf <- sum((test$price_imp - mean(train$price_imp, na.rm = TRUE))^2, na.rm = TRUE)
+
+oos_r2_rf <- 1 - ss_res_rf / ss_tot_rf
+cat("RF OOS R2 (log):", round(oos_r2_rf, 3), "\n")
+```
+
+# Shiny
+
+```{r}
+colnames(clean_df)
+```
+
+```{r}
+print(data.frame(colSums(is.na(clean_df)) / nrow(clean_df) * 100))
+```
+
+```{r}
+describe(clean_df)
+```
+
+Defines the User Interface (UI) for an interactive Shiny dashboard, featuring sky-blue themed filters for price and bedrooms, KPI's, and four distinct data visualizations
+
+```{r}
+# Assumes `clean_df` is already loaded in the environment
+# color to use everywhere
+skyblue <- "#87CEEB"
+
+# precompute UI extremes once (faster and cleaner)
+min_price_imp <- floor(min(clean_df$price_imp, na.rm = TRUE))
+max_price_imp <- ceiling(max(clean_df$price_imp, na.rm = TRUE))
+min_bed <- min(clean_df$Bedrooms, na.rm = TRUE)
+max_bed <- max(clean_df$Bedrooms, na.rm = TRUE)
+furn_choices <- sort(unique(as.character(clean_df$furnishing)))
+
+ui <- dashboardPage(
+  dashboardHeader(title = "Simple House Price Dashboard"),
+  dashboardSidebar(
+    sliderInput(
+      "price_imp_range", "Price range:",
+      min = min_price_imp,
+      max = max_price_imp,
+      value = c(min_price_imp, max_price_imp),
+      step = 1000
+      # removed animate to avoid continuous updates
+    ),
+    checkboxGroupInput(
+      "furn_filter", "Furnishing (select):",
+      choices = furn_choices,
+      selected = furn_choices
+    ),
+    sliderInput(
+      "bed_range", "Bedrooms range:",
+      min = min_bed,
+      max = max_bed,
+      value = c(min_bed, max_bed),
+      step = 1
+    ),
+    hr(),
+    checkboxInput("show_table", "Show table", value = TRUE)
+  ),
+  dashboardBody(
+    fluidRow(
+      valueBoxOutput("kpi_avg_price", width = 4),
+      valueBoxOutput("kpi_count_tx", width = 4),
+      valueBoxOutput("kpi_avg_bed", width = 4)
+    ),
+    fluidRow(
+      shinydashboard::box(title = "Histogram: price Distribution", status = "primary", solidHeader = TRUE,
+                          plotOutput("hist_price", height = 280), width = 6),
+      shinydashboard::box(title = "Donut: price by furnishing", status = "primary", solidHeader = TRUE,
+                          plotOutput("donut_furn", height = 280), width = 6)
+    ),
+    fluidRow(
+      shinydashboard::box(title = "Heatmap: numeric columns correlation", status = "primary", solidHeader = TRUE,
+                          plotOutput("heatmap_corr", height = 360), width = 6),
+      shinydashboard::box(title = "Bubble chart: price vs Bedrooms", status = "primary", solidHeader = TRUE,
+                          plotOutput("bubble_chart", height = 360), width = 6)
+    ),
+    fluidRow(
+      shinydashboard::box(title = "Mini Table", status = "primary", solidHeader = TRUE,
+                          conditionalPanel("input.show_table == true", DTOutput("sample_table")), width = 12)
+    )
+  )
+)
+
+
+```
+
+defines the Server logic that is used for the dashboard, it filters the raw data based on user input and triggers real-time updates for the KPIs, charts, and data tables.
+
+charts used:
+
+Histogram, Donut Chart, Heatmap & Bubble Chart
+
+```{r}
+server <- function(input, output, session) {
+
+  # --- Basic (instant) reactive that just captures inputs and filters quickly ---
+  filtered_raw <- reactive({
+    req(clean_df)
+    clean_df %>%
+      filter(!is.na(price_imp)) %>%
+      filter(price_imp >= input$price_imp_range[1],
+             price_imp <= input$price_imp_range[2]) %>%
+      filter(furnishing %in% input$furn_filter) %>%
+      filter(Bedrooms >= input$bed_range[1], Bedrooms <= input$bed_range[2])
+  })
+
+  # --- Debounced version: only fires when user stops changing inputs for 700ms ---
+  filtered <- debounce(filtered_raw, 700)
+
+  # --- KPIs (use debounced filtered to avoid flicker) ---
+  output$kpi_avg_price <- renderValueBox({
+    df <- filtered()
+    avgp <- round(mean(df$price_imp, na.rm = TRUE), 2)
+    valueBox(
+      value = format(ifelse(is.finite(avgp), avgp, 0), big.mark = ","),
+      subtitle = "Average Total Price",
+      icon = icon("money-bill"),
+      color = "aqua"
+    )
+  })
+
+  output$kpi_count_tx <- renderValueBox({
+    df <- filtered()
+    cnt <- nrow(df)
+    valueBox(
+      value = cnt,
+      subtitle = "Total Transactions",
+      icon = icon("shopping-cart"),
+      color = "aqua"
+    )
+  })
+
+  output$kpi_avg_bed <- renderValueBox({
+    df <- filtered()
+    avg_val <- df %>% 
+      filter(Bedrooms > 0) %>%
+      summarise(avg = mean(price_imp / Bedrooms, na.rm = TRUE)) %>% 
+      pull(avg)
+    clean_display <- if(is.finite(avg_val)) round(avg_val, 2) else 0
+    valueBox(
+      value = format(clean_display, big.mark = ","),
+      subtitle = "Avg Price per Bedroom",
+      icon = icon("bed"),
+      color = "aqua"
+    )
+  })
+
+  # --- Utility: sampling helper to speed plotting on large datasets ---
+  sample_if_large <- function(df, max_rows = 3000) {
+    if (nrow(df) > max_rows) {
+      df %>% sample_n(max_rows)
+    } else df
+  }
+
+  # Histogram (use sampled data if very large)
+  output$hist_price <- renderPlot({
+    df <- filtered()
+    req(nrow(df) > 0)
+    df_plot <- sample_if_large(df, max_rows = 5000)
+    ggplot(df_plot, aes(x = price_imp)) +
+      geom_histogram(bins = 30, fill = skyblue, color = "white") +
+      labs(x = "Price", y = "Count") +
+      theme_minimal()
+  })
+
+  # Donut: small aggregation (cheap) - still use debounced df
+  output$donut_furn <- renderPlot({
+    df <- filtered()
+    req(nrow(df) > 0)
+    df2 <- df %>%
+      group_by(furnishing) %>%
+      summarise(total_price = sum(price_imp, na.rm = TRUE)) %>%
+      arrange(desc(total_price)) %>%
+      mutate(pct = total_price / sum(total_price) * 100,
+             ypos = cumsum(pct) - 0.5 * pct)
+
+    pal <- colorRampPalette(c("#dff6fb", skyblue, "#2e86c1"))(max(3, nrow(df2)))
+
+    ggplot(df2, aes(x = 2, y = pct, fill = furnishing)) +
+      geom_bar(stat = "identity", width = 1, color = "white") +
+      coord_polar("y", start = 0) +
+      xlim(0.5, 2.5) +
+      theme_void() +
+      geom_text(aes(y = ypos, label = paste0(furnishing, "\n", round(pct,1), "%")), color = "black", size = 3) +
+      scale_fill_manual(values = pal) +
+      guides(fill = guide_legend(title = "Furnishing")) +
+      theme(legend.position = "right")
+  })
+
+  # Heatmap: use renderCachedPlot and sampling for large rows (cor on many rows is heavy)
+  output$heatmap_corr <- renderCachedPlot({
+    df <- filtered()
+    numdf <- df %>% select_if(is.numeric)
+    if ("index" %in% names(numdf)) numdf$index <- NULL
+    req(ncol(numdf) >= 2)
+
+    # sample rows if huge (correlation stabilizes on a modest sample)
+    if (nrow(numdf) > 3000) numdf <- numdf %>% sample_n(3000)
+
+    cmat <- cor(numdf, use = "pairwise.complete.obs")
+    cm_melt <- reshape2::melt(cmat)
+    ggplot(cm_melt, aes(Var1, Var2, fill = value)) +
+      geom_tile(color = "white") +
+      geom_text(aes(label = round(value, 2)), size = 3) +
+      scale_fill_gradient(low = "white", high = skyblue, limits = c(-1, 1)) +
+      theme_minimal() +
+      theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1)) +
+      labs(x = NULL, y = NULL, fill = "Corr")
+  }, cacheKeyExpr = list(input$price_imp_range, input$furn_filter, input$bed_range))
+
+  # Bubble chart: sample when large
+  output$bubble_chart <- renderPlot({
+    df <- filtered()
+    req(nrow(df) > 0)
+
+    df_plot <- df %>%
+      filter(!is.na(price_imp), !is.na(Current_Floor), !is.na(bathroom))
+
+    df_plot <- sample_if_large(df_plot, max_rows = 4000)
+
+    ggplot(df_plot, aes(x = price_imp, y = Current_Floor, size = Bedrooms)) +
+      geom_point(shape = 21, color = "#3b7bbf", fill = skyblue, alpha = 0.6) +
+      scale_size(range = c(3, 14)) +
+      labs(title = "Price vs Current Floor", x = "Total Price (price_imp)", y = "Current Floor", size = "Bedrooms") +
+      theme_minimal()
+  })
+
+  # DT sample table
+  output$sample_table <- renderDT({
+    df <- filtered()
+    if (nrow(df) == 0) return(datatable(data.frame()))
+    showcols <- intersect(c("index", "location", "furnishing", "Bedrooms", "bathroom", "price_imp"), names(df))
+    datatable(df %>% select(all_of(showcols)),
+              options = list(pageLength = 10, scrollX = TRUE))
+  })
+
+}
+
+shinyApp(ui, server)
+```
+
+```{r}
+colnames(clean_df)
+```
+
+# Simulation
+
+Counts the number of observations in the dataset
+
+```{r}
+n<- nrow(clean_df)
+n
+```
+
+Creates a fake, computer-generated version of the data that keeps the same statistical characteristics as the real thing.
+
+```{r}
+set.seed(123)
+n <- nrow(clean_df)
+
+sim_cont <- list()
+
+sim_cont$log_price <- rnorm(
+  n,
+  mean = mean(clean_df$log_price, na.rm = TRUE),
+  sd   = sd(clean_df$log_price, na.rm = TRUE)
+)
+
+sim_cont$price_imp <- exp(sim_cont$log_price)
+
+count_cols <- c("Current_Floor", "Total_Floors", "bathroom", 
+                "balcony", "Bedrooms")
+
+sim_count <- lapply(count_cols, function(col){
+  lambda <- mean(clean_df[[col]], na.rm = TRUE)
+  rpois(n, lambda = lambda)
+})
+names(sim_count) <- count_cols
+
+cat_cols <- c("title", "location", "furnishing", "transaction", "floor_type")
+
+sim_cat <- lapply(cat_cols, function(col){
+  prop <- prop.table(table(clean_df[[col]]))
+  sample(names(prop), size = n, replace = TRUE, prob = prop)
+})
+names(sim_cat) <- cat_cols
+
+sim_index <- 1:n
+
+simulated_df <- data.frame(
+  Index = sim_index,
+  sim_cat,
+  sim_cont,
+  sim_count
+)
+
+head(simulated_df)
+
+```
+
+```{r}
+count(simulated_df)
+```
+
+Calculates and displays the percentage of missing values (nulls) for every column in the dataset.
+
+```{r}
+print(data.frame(colSums(is.na(simulated_df)) / nrow(simulated_df) * 100))
+```
+
+Creates an overlapping histogram to visually compare the distribution of real prices versus the simulated ones.
+
+```{r}
+hist(clean_df$price_imp, col=rgb(0,0,1,0.5), breaks=20, main="Price: Real vs Simulated")
+hist(simulated_df$price_imp, col=rgb(1,0,0,0.5), breaks=20, add=TRUE)
+legend("topright", legend=c("Real","Simulated"), fill=c(rgb(0,0,1,0.5), rgb(1,0,0,0.5)))
+```
+
+Creates a density plot (a smoothed version of a histogram) to show how closely the "smoothness" and "spread" of the simulated prices match the real data.
+
+```{r}
+plot(
+  density(clean_df$price_imp, na.rm = TRUE),
+  col = "blue",
+  lwd = 3,
+  main = "Price Density: Real vs Simulated",
+  xlab = "price"
+)
+
+lines(
+  density(simulated_df$price_imp, na.rm = TRUE),
+  col = "red",
+  lwd = 3
+)
+
+legend(
+  "topright",
+  legend = c("Real", "Simulated"),
+  col = c("blue", "red"),
+  lwd = 3
+)
+```
+
+```{r}
+colnames(simulated_df)
+```
+
+t-test indicates a statistically significant fail, proving that your simulated prices are not matching the real prices
+
+```{r}
+t.test(clean_df$price_imp, simulated_df$price_imp)
+```
+
+Performs a Chi-squared test to statistically verify that the simulated "furnishing" categories
+
+```{r}
+table_real <- table(clean_df$furnishing)
+table_sim  <- table(simulated_df$furnishing)
+stats::chisq.test(rbind(table_real, table_sim))
+```
+
+One-way ANOVA shows no statistically significant difference in mean simulated prices across furnishing categories (F = 0.07, p = 0.93), which is expected since categorical variables were simulated independently of price.
+
+```{r}
+sim_data <- lm(simulated_df$price_imp ~ simulated_df$furnishing)
+anova(sim_data)
+```
